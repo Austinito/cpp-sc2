@@ -1,7 +1,11 @@
 #include <sc2api/sc2_api.h>
+#include <sc2api/sc2_data.h>
 #include <sc2api/sc2_unit_filters.h>
 
 #include <iostream>
+
+// Number of workers to assign to each townhall
+const int kWorkersPerTownhall = 16;
 
 using namespace sc2;
 
@@ -17,24 +21,27 @@ public:
                    "Vespene", Observation()->GetVespene());
         }
 
-        if (TryBuildSupplyDepot()) {
-            std::cout << "Supply depot" << std::endl;
-        }
-
-        if (TryBuildVespeneGas()) {
-            std::cout << "Vespene gas" << std::endl;
-        }
+        HandleTownhall();
     }
 
     virtual void OnUnitIdle(const Unit* unit) final {
         switch (unit->unit_type.ToType()) {
             case UNIT_TYPEID::TERRAN_COMMANDCENTER: {
-                Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_SCV);
+                // Check the number of SCV's and build more if needed
+                int numSCVs = Observation()->GetFoodWorkers();
+                int maxSCVs = kWorkersPerTownhall * Observation()->GetUnits(Unit::Alliance::Self, IsTownHall()).size();
+                int numRefineries = Observation()->GetUnits(Unit::Alliance::Self, IsVisibleGeyser()).size();
+                maxSCVs += numRefineries * 3;
+                if (numSCVs < maxSCVs) {
+                    std::cout << "Building SCV: " << numSCVs << " of " << maxSCVs << std::endl;
+                    Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_SCV);
+                }
                 break;
             }
             case UNIT_TYPEID::TERRAN_REFINERY:
-                std::cout << "Refinery is idle" << std::endl;
-            case UNIT_TYPEID::TERRAN_REFINERYRICH: 
+                AssignWorker(unit);
+                break;
+            case UNIT_TYPEID::TERRAN_REFINERYRICH:
                 AssignWorker(unit);
                 break;
             case UNIT_TYPEID::TERRAN_SCV: {
@@ -46,9 +53,8 @@ public:
                     break;
                 }
             }
-            default: {
+            default:
                 break;
-            }
         }
     }
 
@@ -56,6 +62,40 @@ public:
         if (unit->unit_type == UNIT_TYPEID::TERRAN_REFINERY) {
             for (int i = 0; i < 3; i++) {
                 AssignWorker(unit);
+            }
+        }
+    }
+
+    void HandleTownhall() {
+        if (TryBuildSupplyDepot()) {
+            std::cout << "Building supply depot" << std::endl;
+        }
+
+        if (TryBuildVespeneGas()) {
+            std::cout << "Building refinery" << std::endl;
+        }
+
+        BalanceWorkers();
+    }
+
+    void BalanceWorkers() {
+        const ObservationInterface* observation = Observation();
+        int onMineralPatch = observation->GetUnits(Unit::Alliance::Self, IsTownHall()).front()->assigned_harvesters;
+        if (onMineralPatch > kWorkersPerTownhall) {
+            std::cout << "Moving workers to gas" << std::endl;
+            std::vector<const Unit*> refineriesWithoutMaxWorkers;
+
+            for (const auto& unit : observation->GetUnits(Unit::Alliance::Self, IsBuilding())) {
+                if (unit->unit_type == UNIT_TYPEID::TERRAN_REFINERY && unit->assigned_harvesters < 3) {
+                    refineriesWithoutMaxWorkers.push_back(unit);
+                }
+            }
+
+            if (!refineriesWithoutMaxWorkers.empty()) {
+                std::cout << "Assigning worker to geyser" << std::endl;
+                AssignWorker(refineriesWithoutMaxWorkers.front());
+            } else {
+                std::cout << "No refineries without max workers" << std::endl;
             }
         }
     }
@@ -127,38 +167,14 @@ public:
         return Point2D(start.x + rx * 15.0f, start.y + ry * 15.0f);
     }
 
-    const Tag FindClosestGeyser(const Point2D& start) {
-        const ObservationInterface* observation = Observation();
-        Units geysers = observation->GetUnits(Unit::Alliance::Neutral, IsVisibleGeyser());
-        float distance = std::numeric_limits<float>::max();
-        const Unit* target = nullptr;
-        for (const auto& g : geysers) {
-            float d = DistanceSquared2D(g->pos, start);
-            if (d < distance) {
-                if (Query()->Placement(ABILITY_ID::BUILD_REFINERY, g->pos)) {
-                    distance = d;
-                    target = g;
-                }
-            }
-        }
-        if (!target) {
-            return NULL;
-        }
-        // std::cout << "FindOpenGeyser: returning target POS: (" << target->pos.x << ", " << target->pos.y << ")"
-        // << std::endl;
-        return target->tag;
-    }
-
     bool TryBuildSupplyDepot() {
         const ObservationInterface* observation = Observation();
-
         // If we are not supply capped, don't build a supply depot.
         if (observation->GetFoodUsed() <= observation->GetFoodCap() - 2)
             return false;
 
         // Try and build a depot. Find a random SCV and give it the order.
         int numDepots = observation->GetFoodUsed() / 12;
-        // std::cout << "Asked to build " << numDepots << "Supply depots." << std::endl;
         return TryBuildStructure(ABILITY_ID::BUILD_SUPPLYDEPOT, UNIT_TYPEID::TERRAN_SCV, numDepots);
     }
 
@@ -166,14 +182,25 @@ public:
         const ObservationInterface* observation = Observation();
 
         // If we have more than 14 SCV's then build a vespene
+        // we don't need more than 2 refineries
         if (observation->GetFoodWorkers() < 14)
             return false;
-        auto loc = observation->GetStartLocation();
-        Tag geyserTag = FindClosestGeyser(Point2D(loc.x, loc.y));
 
-        if (geyserTag) {
-            // Try and build a depot. Find a random SCV and give it the order.
-            return TryBuildStructure(ABILITY_ID::BUILD_REFINERY, UNIT_TYPEID::TERRAN_SCV, geyserTag);
+        Units buildings = observation->GetUnits(Unit::Alliance::Self, IsBuilding());
+        int numRefineries = 0;
+        for (const auto& building : buildings) {
+            if (building->unit_type == UNIT_TYPEID::TERRAN_REFINERY) {
+                numRefineries++;
+            }
+        }
+        if (numRefineries >= 2)
+            return false;
+
+        Point2D loc = observation->GetStartLocation();
+        const Unit* geyser = FindClosestGeyser(loc);
+
+        if (geyser) {
+            return TryBuildStructure(ABILITY_ID::BUILD_REFINERY, UNIT_TYPEID::TERRAN_SCV, geyser->tag);
         } else {
             return false;
         }
@@ -189,17 +216,32 @@ public:
         }
     }
 
+    const Unit* FindClosestGeyser(const Point2D& start) {
+        Units units = Observation()->GetUnits(Unit::Alliance::Neutral, IsVisibleGeyser());
+        float distance = std::numeric_limits<float>::max();
+        const Unit* target = nullptr;
+        for (auto u : units) {
+            if (u->unit_type != UNIT_TYPEID::NEUTRAL_VESPENEGEYSER) {
+                continue;
+            }
+            float d = DistanceSquared2D(u->pos, start);
+            if (d < distance) {
+                distance = d;
+                target = u;
+            }
+        }
+        return target;
+    }
+
     const Unit* FindNearestMineralPatch(const Point2D& start) {
-        Units units = Observation()->GetUnits(Unit::Alliance::Neutral);
+        Units units = Observation()->GetUnits(Unit::Alliance::Neutral, IsVisibleMineralPatch());
         float distance = std::numeric_limits<float>::max();
         const Unit* target = nullptr;
         for (const auto& u : units) {
-            if (u->unit_type == UNIT_TYPEID::NEUTRAL_MINERALFIELD) {
-                float d = DistanceSquared2D(u->pos, start);
-                if (d < distance) {
-                    distance = d;
-                    target = u;
-                }
+            float d = DistanceSquared2D(u->pos, start);
+            if (d < distance) {
+                distance = d;
+                target = u;
             }
         }
         return target;
@@ -228,7 +270,6 @@ public:
         }
         return closest;
     }
-
 };
 
 int main(int argc, char* argv[]) {
