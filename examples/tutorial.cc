@@ -22,6 +22,8 @@ public:
         }
 
         HandleTownhall();
+
+        TryBuildBarracks();
     }
 
     virtual void OnUnitIdle(const Unit* unit) final {
@@ -52,6 +54,19 @@ public:
                     Actions()->UnitCommand(unit, ABILITY_ID::SMART, mineral_target);
                     break;
                 }
+            }
+            case UNIT_TYPEID::TERRAN_BARRACKS: {
+                Actions()->UnitCommand(unit, ABILITY_ID::TRAIN_MARINE);
+                break;
+            }
+            case UNIT_TYPEID::TERRAN_MARINE: {
+                if (CountUnitType(UNIT_TYPEID::TERRAN_MARINE) >= 15) {
+                    const GameInfo& game_info = Observation()->GetGameInfo();
+                    Actions()->UnitCommand(unit, ABILITY_ID::ATTACK_ATTACK, game_info.enemy_start_locations.front());
+                } else {
+                    Actions()->UnitCommand(unit, ABILITY_ID::ATTACK_ATTACK, GetRandomNearbyLocation(unit->pos));
+                }
+                break;
             }
             default:
                 break;
@@ -98,6 +113,24 @@ public:
                 std::cout << "No refineries without max workers" << std::endl;
             }
         }
+    }
+
+    bool TryBuildBarracks() {
+        const ObservationInterface* observation = Observation();
+
+        if (CountUnitType(UNIT_TYPEID::TERRAN_SUPPLYDEPOT) < 1) {
+            return false;
+        }
+
+        if (CountUnitType(UNIT_TYPEID::TERRAN_BARRACKS) >= 3) {
+            return false;
+        }
+
+        return TryBuildStructure(ABILITY_ID::BUILD_BARRACKS);
+    }
+
+    size_t CountUnitType(UNIT_TYPEID unit_type) {
+        return Observation()->GetUnits(Unit::Alliance::Self, IsUnit(unit_type)).size();
     }
 
     bool TryBuildStructure(ABILITY_ID ability_type_for_structure, UNIT_TYPEID unit_type, Tag location_tag) {
@@ -186,14 +219,7 @@ public:
         if (observation->GetFoodWorkers() < 14)
             return false;
 
-        Units buildings = observation->GetUnits(Unit::Alliance::Self, IsBuilding());
-        int numRefineries = 0;
-        for (const auto& building : buildings) {
-            if (building->unit_type == UNIT_TYPEID::TERRAN_REFINERY) {
-                numRefineries++;
-            }
-        }
-        if (numRefineries >= 2)
+        if (CountUnitType(UNIT_TYPEID::TERRAN_REFINERY) >= 2)
             return false;
 
         Point2D loc = observation->GetStartLocation();
